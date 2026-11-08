@@ -1,0 +1,23 @@
+services:
+  agentic-harness:
+    build: .
+    container_name: dale-agent
+    stdin_open: true
+    tty: true
+    environment:
+      # Ollama running on this computer (the host), reached from inside the container
+      - OLLAMA_URL=http://host.docker.internal:11434/v1
+      # Tavily API key (optional, for better web search)
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
+      # Browser headless mode (set to 0 to see browser)
+      - BROWSER_HEADLESS=${BROWSER_HEADLESS:-1}
+    volumes:
+      # Mount workspace for file operations
+      - ./workspace:/app/workspace
+      # Mount data for profile, browser cookies, reflections
+      - ./data:/app/data
+      # Mount logs for audit logs
+      - ./logs:/app/logs
+    # Lets the container reach Ollama on the host (also on Linux)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

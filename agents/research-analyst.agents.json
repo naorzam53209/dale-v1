@@ -1,0 +1,308 @@
+{
+  "manifest_version": "1.0",
+  "profiles": ["core", "exec", "gov"],
+
+  "agent": {
+    "id": "ajson://dale.local/agents/research-analyst",
+    "name": "Research Analyst",
+    "description": "Finds facts on the web, verifies them against the source pages, and delivers them as cited answers, Excel spreadsheets, or Markdown reports in the workspace folder.",
+    "version": "1.0.0",
+    "license": "Apache-2.0",
+    "tags": ["research", "web-search", "spreadsheets", "reports"]
+  },
+
+  "capabilities": [
+    { "id": "retrieval", "description": "Search the web and open source pages to collect information." },
+    { "id": "extraction", "description": "Pull structured data (names, numbers, dates) out of web pages and tables." },
+    { "id": "summarization", "description": "Condense findings into short answers and written reports." },
+    { "id": "qa", "description": "Answer factual questions with cited sources." },
+    { "id": "generation", "description": "Produce deliverables: .xlsx spreadsheets and Markdown reports." }
+  ],
+
+  "tools": [
+    {
+      "id": "tool://web_search",
+      "name": "web_search",
+      "description": "Search the web (Tavily, or DuckDuckGo as fallback). Returns titles, links and short extracts. Extracts are not reliable for numbers: open the page with fetch_page.",
+      "type": "function",
+      "endpoint": "agentic_harness_build.tools:web_search",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string", "description": "Specific search query, e.g. 'Japan cities population 2020 census'." },
+          "max_results": { "type": "integer", "description": "How many results to return (1-10, default 5)." }
+        },
+        "required": ["query"]
+      },
+      "output_schema": { "type": "string", "description": "Numbered results: title, URL, snippet." },
+      "metadata": { "category": "web" }
+    },
+    {
+      "id": "tool://fetch_page",
+      "name": "fetch_page",
+      "description": "Read the text of a web page, e.g. a link from web_search. Tables come back as 'a | b | c' rows. Long pages are cut at 8,000 characters.",
+      "type": "function",
+      "endpoint": "agentic_harness_build.tools:fetch_page",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "url": { "type": "string", "description": "Full URL starting with https://" }
+        },
+        "required": ["url"]
+      },
+      "output_schema": { "type": "string", "description": "Page title, URL, then the readable page text." },
+      "metadata": { "category": "web" }
+    },
+    {
+      "id": "tool://list_files",
+      "name": "list_files",
+      "description": "List files in the workspace folder.",
+      "type": "system",
+      "endpoint": "agentic_harness_build.tools:list_files",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "subdir": { "type": "string", "description": "Optional subfolder inside the workspace. Leave empty for the top level." }
+        },
+        "required": []
+      },
+      "output_schema": { "type": "string", "description": "One path per line; folders end with '/'." },
+      "metadata": { "category": "filesystem", "writes": false }
+    },
+    {
+      "id": "tool://read_file",
+      "name": "read_file",
+      "description": "Read a text file from the workspace folder.",
+      "type": "system",
+      "endpoint": "agentic_harness_build.tools:read_file",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string", "description": "Path relative to the workspace, e.g. 'notes.txt'." }
+        },
+        "required": ["path"]
+      },
+      "output_schema": { "type": "string", "description": "The file's text." },
+      "metadata": { "category": "filesystem", "writes": false }
+    },
+    {
+      "id": "tool://write_file",
+      "name": "write_file",
+      "description": "Create or overwrite a text file in the workspace folder. Use it for Markdown reports (.md) and notes.",
+      "type": "system",
+      "endpoint": "agentic_harness_build.tools:write_file",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string", "description": "Path relative to the workspace, e.g. 'reports/japan_cities.md'." },
+          "content": { "type": "string", "description": "The full text to write into the file." }
+        },
+        "required": ["path", "content"]
+      },
+      "output_schema": { "type": "string", "description": "Confirmation with the number of characters written." },
+      "metadata": { "category": "filesystem", "writes": true }
+    },
+    {
+      "id": "tool://create_spreadsheet",
+      "name": "create_spreadsheet",
+      "description": "Create an Excel spreadsheet (.xlsx) in the workspace folder from a header row and data rows.",
+      "type": "system",
+      "endpoint": "agentic_harness_build.tools:create_spreadsheet",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string", "description": "File name relative to the workspace, e.g. 'japan_largest_cities.xlsx'." },
+          "headers": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Column names with units, e.g. [\"City\", \"Population (2020)\", \"Source\"]."
+          },
+          "rows": {
+            "type": "array",
+            "items": { "type": "array", "items": { "type": ["string", "number"] } },
+            "description": "One list per row, in the same order as headers, e.g. [[\"Tokyo\", 14047594, \"https://...\"]]."
+          }
+        },
+        "required": ["path", "headers", "rows"]
+      },
+      "output_schema": { "type": "string", "description": "Confirmation with the column and row counts." },
+      "metadata": { "category": "filesystem", "writes": true }
+    },
+    {
+      "id": "tool://memory",
+      "name": "memory",
+      "description": "Read, write, and edit memory files. Use to store learnings, preferences, and context across sessions. Memory lives in data/memory/.",
+      "type": "function",
+      "endpoint": "agentic_harness_build.memory:memory",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "command": { "type": "string", "enum": ["view", "create", "str_replace", "insert", "delete", "rename"], "description": "Memory operation to perform" },
+          "path": { "type": "string", "description": "Path under /memories/, e.g. '/memories/notes.md'" },
+          "file_text": { "type": "string", "description": "Content for create command" },
+          "old_str": { "type": "string", "description": "Text to replace for str_replace" },
+          "new_str": { "type": "string", "description": "Replacement text for str_replace" },
+          "insert_line": { "type": "integer", "description": "Line number for insert (0 = beginning)" },
+          "insert_text": { "type": "string", "description": "Text to insert" },
+          "old_path": { "type": "string", "description": "Source path for rename" },
+          "new_path": { "type": "string", "description": "Destination path for rename" },
+          "view_range": { "type": "array", "items": { "type": "integer" }, "description": "[start, end] line range for view" }
+        },
+        "required": ["command", "path"]
+      },
+      "output_schema": { "type": "string" },
+      "metadata": { "category": "memory" }
+    }
+  ],
+
+  "modalities": {
+    "input": ["text"],
+    "output": ["text", "markdown", "xlsx"]
+  },
+
+  "context": {
+    "strategy": "conversation",
+    "persistent": false
+  },
+
+  "runtime": {
+    "type": "python",
+    "language": "python",
+    "entrypoint": "harness:main",
+    "env": {
+      "OLLAMA_URL": "Base URL of the OpenAI-compatible Ollama server (optional)",
+      "TAVILY_API_KEY": "Tavily search API key (optional; without it web_search uses DuckDuckGo)"
+    }
+  },
+
+  "security": {
+    "sandbox": "workspace-directory",
+    "network_zone": "public-internet",
+    "sensitive_data_handling": "File tools are confined to workspace/. Web fetches are limited to public https URLs. Tool calls that write files are recorded in the audit log."
+  },
+
+  "policies": [
+    {
+      "id": "https-only",
+      "description": "Only fetch pages over https.",
+      "effect": "deny",
+      "action": "tool.call",
+      "where": "tool.name == 'fetch_page' && args.url !~ '^https://'"
+    },
+    {
+      "id": "no-private-network",
+      "description": "Never fetch localhost or private-network addresses.",
+      "effect": "deny",
+      "action": "tool.call",
+      "where": "tool.name == 'fetch_page' && args.url ~ '^https?://(localhost|127\\.|0\\.0\\.0\\.0|10\\.|192\\.168\\.|169\\.254\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|\\[)'"
+    },
+    {
+      "id": "no-executable-files",
+      "description": "The analyst writes data and documents, never scripts or programs.",
+      "effect": "deny",
+      "action": "tool.call",
+      "where": "tool.metadata.writes == true && args.path ~ '(?i)\\.(py|sh|bash|zsh|command|bat|cmd|ps1|exe|js|app)$'"
+    },
+    {
+      "id": "audit-file-writes",
+      "description": "Record every file the agent creates or overwrites.",
+      "effect": "audit",
+      "action": "tool.call",
+      "where": "tool.metadata.writes == true"
+    }
+  ],
+
+  "observability": {
+    "log_level": "info",
+    "log_sink": "file://logs/audit.jsonl",
+    "redact_sensitive": false,
+    "metrics_enabled": false,
+    "trace_enabled": false
+  },
+
+  "x-model": {
+    "provider": "ollama",
+    "name": "qwen3.5:4b-16k",
+    "base_url": "http://localhost:11434/v1",
+    "base_url_env": "OLLAMA_URL",
+    "temperature": 0.3,
+    "timeout_seconds": 300,
+    "max_steps": 15,
+    "context_window": 16384
+  },
+
+  "x-reply": { "max_chars": 400, "verify_phone_numbers": true },
+
+  "x-reflection": {
+    "enabled": true,
+    "strategy": "reflexion",
+    "task_type": "research",
+    "reflect_after": "every_turn",
+    "max_reflections": 5,
+    "max_retries": 2
+  },
+
+  "x-memory": {
+    "enabled": true,
+    "auto_extract": true,
+    "max_learnings_per_turn": 3,
+    "memory_dir": "data/memory"
+  },
+
+  "x-instructions": [
+    "You are Research Analyst, a meticulous research assistant. You find facts on the web, verify them against the source page, and deliver them as cited answers, Excel spreadsheets, or Markdown reports saved in the workspace folder.",
+    "",
+    "CRITICAL: Never assume the user's intent. If the request is ambiguous or could be interpreted multiple ways, ask for clarification BEFORE starting research. Do not begin searching or analyzing until you are certain what the user wants.",
+    "",
+    "Answer the user's question directly. Never greet the user, introduce yourself, or explain what you are going to do; start working right away.",
+    "",
+    "## How you work",
+    "1. Understand the request. Only if it is truly ambiguous (which metric, which year, how many items) ask ONE short question; otherwise start working.",
+    "2. Search with web_search using specific queries (include the year, the metric, the place).",
+    "3. Open the 1-3 most authoritative results with fetch_page: official statistics, Wikipedia tables, company or government sites. Take numbers from the page text, never from search snippets or memory.",
+    "4. If two sources disagree on an important number, use the more official or more recent one and mention the difference.",
+    "   Check the date of every source: it must be about the period the user asked for (e.g. this quarter, this year), not an older one.",
+    "5. Deliver what was asked: an answer, a spreadsheet, a report, or several of these.",
+    "",
+    "## Spreadsheets (create_spreadsheet)",
+    "- Gather all the data first, then call create_spreadsheet ONCE with every row.",
+    "- First column is the item name. Put units and years in the headers, e.g. 'Population (2020)', 'Price (USD)'.",
+    "- Write numbers as plain numbers: 14047594, not '14,047,594' or '$14M'.",
+    "- Add a final 'Source' column with the URL each row came from.",
+    "- Use a descriptive snake_case file name, e.g. 'japan_largest_cities.xlsx'.",
+    "",
+    "## Reports (write_file)",
+    "- Markdown (.md): a title, a 2-3 sentence summary, key findings as bullet points, then a 'Sources' list of URLs.",
+    "",
+    "## Forecasts and upcoming events",
+    "- For 'what to expect', 'will', 'forecast' or 'preview' questions (earnings, releases, elections), search for previews, analyst consensus and guidance, e.g. 'Apple Q4 2026 earnings preview consensus EPS revenue'.",
+    "- Clearly separate expectations (estimates, guidance) from reported results. Never present an older period's results as the upcoming ones.",
+    "",
+    "## Rules",
+    "- Never invent data. If a value cannot be found, write 'n/a' and say so.",
+    "- Always list the source URLs you used in your final answer.",
+    "- If a tool returns an error, read it and change your approach (another query, another page) instead of repeating the same call. If a site blocks access (HTTP 403), move on to another source.",
+    "- If a tool call is blocked by policy, do not try to work around it; tell the user what was blocked.",
+    "- If you created files, name them in a few words, e.g. 'Saved japan_largest_cities.xlsx.'",
+    "",
+    "## How you talk",
+    "- Use very few words. Your final answer is at most 2-3 short sentences with the key facts and numbers, then the source link(s) on one line.",
+    "- No headings, tables or bullet lists unless the user asks for them. Details belong in a spreadsheet or report, not in the chat.",
+    "- Example final answer: 'Analysts expect EPS of $1.98 and revenue of $113.3B, reported after the close today. Source: https://...'",
+    "- Plain text only: no **bold**, no #, no bullet points.",
+    "",
+    "## Conversation",
+    "- For greetings, small talk, or general questions: respond naturally and briefly",
+    "- Don't use tools for simple conversation - just answer directly",
+    "- Examples: 'hello' -> 'Hi! How can I help you today?'",
+    "- 'how are you' -> 'I'm doing well, thanks! What can I help you with?'",
+    "- Only use tools when the user asks for research, data, or specific information",
+    "",
+    "## Memory",
+    "- Before starting a task, use memory tool to check for relevant learnings: view /memories/MEMORY.md",
+    "- As you work, record important learnings: user preferences, corrections, what worked/failed",
+    "- Memory files are Markdown with YAML frontmatter (type: user|feedback|project|reference)",
+    "- Keep MEMORY.md as an index (one line per memory file)",
+    "- Write learnings that would help in future sessions, not obvious facts"
+  ]
+}

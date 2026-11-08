@@ -1,0 +1,75 @@
+{
+  "manifest_version": "1.0",
+  "profiles": ["core", "exec", "graph"],
+
+  "agent": {
+    "id": "ajson://dale.local/agents/assistant",
+    "name": "Assistant",
+    "description": "One assistant for everything: sends each message to the agent that should handle it (research or booking). The conversation is shared, so follow-ups work across agents.",
+    "version": "1.0.0",
+    "license": "Apache-2.0",
+    "tags": ["router", "assistant"]
+  },
+
+  "capabilities": [
+    { "id": "routing", "description": "Pick the right agent for each user message, using the conversation so far." }
+  ],
+
+  "runtime": {
+    "type": "python",
+    "language": "python",
+    "entrypoint": "harness:main",
+    "env": { "OLLAMA_URL": "Base URL of the OpenAI-compatible Ollama server (optional)" }
+  },
+
+  "graph": {
+    "nodes": [
+      { "id": "router", "ref": "ajson://dale.local/agents/assistant", "role": "router" },
+      {
+        "id": "research",
+        "ref": "agents/research-analyst.agents.json",
+        "role": "research",
+        "metadata": {
+          "description": "Facts, news, prices, statistics, earnings, comparisons, general recommendations without a date/time to go; spreadsheets and reports; reading or writing workspace files. Also general questions and small talk."
+        }
+      },
+      {
+        "id": "booking",
+        "ref": "agents/booking-assistant.agents.json",
+        "role": "booking",
+        "metadata": {
+          "description": "Booking or reserving a table or a place; finding a restaurant or venue to go to at a given date/time (e.g. 'a chinese place for 4 on Friday night'); checking whether a venue has availability or free tables; cancelling or changing a reservation."
+        }
+      }
+    ],
+    "edges": [
+      { "from": "router", "to": "booking", "condition": "message.intent == 'booking'" },
+      { "from": "router", "to": "research" }
+    ]
+  },
+
+  "observability": {
+    "log_level": "info"
+  },
+
+  "x-model": {
+    "provider": "ollama",
+    "name": "qwen3.5:4b-16k",
+    "base_url": "http://localhost:11434/v1",
+    "base_url_env": "OLLAMA_URL",
+    "temperature": 0,
+    "timeout_seconds": 60,
+    "max_steps": 1,
+    "context_window": 16384
+  },
+
+  "x-instructions": [
+    "You decide which assistant handles the user's latest message.",
+    "Any question about free tables, space or availability at a restaurant or venue goes to booking, even when the user says 'just check' or 'don't book': only booking can open reservation systems.",
+    "Use the conversation so far: a follow-up like 'book the first one' or 'yes, reserve it' goes to booking; 'what do they serve?' or 'how much is it?' goes to research.",
+    "General conversation, greetings, small talk, and casual questions go to research (it handles chat naturally).",
+    "Specific questions needing facts, data, or research go to research.",
+    "Booking/reservation requests go to booking.",
+    "Reply with only the assistant's name, nothing else."
+  ]
+}
