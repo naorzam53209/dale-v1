@@ -10,7 +10,9 @@ from openai import APIError, OpenAI
 
 from agentic_harness_build import ui
 from agentic_harness_build.manifest import ManifestError, load_assistant
-from agentic_harness_build.reflection import SUBMITTED_MARKER, ReflectionEngine, ReflexionStrategy
+from agentic_harness_build.reflection import (
+    SUBMITTED_MARKER, USER_ANSWER_PREFIXES, USER_TOOLS, ReflectionEngine, ReflexionStrategy,
+)
 from agentic_harness_build.memory import load_memory_index, ensure_memory_dir
 from agentic_harness_build.auto_memory import extract_learnings, save_learnings
 
@@ -183,6 +185,7 @@ def run_agent(agent, client, messages: list, user_input: str = "") -> str:
             break
         # reflect on the failed attempt (once), then run the turn again from the start
         engine.update_reflections(user_input, outcome["tool_log"], answer, client, agent.model, reflect_after="every_turn")
+        _reset_tool_state(agent)
 
     messages[:] = attempt_messages
     # the kept attempt has not been reflected on yet: do it now if the manifest asks for it
@@ -191,15 +194,30 @@ def run_agent(agent, client, messages: list, user_input: str = "") -> str:
     return answer
 
 
+def _reset_tool_state(agent):
+    """Undo what a failed attempt left behind that the retry cannot see in its fresh conversation.
+
+    The browser would still show the old page with stale refs and keep an approved card usable,
+    so close it (which also wipes the card). Lists like the failed-URL cache are kept on purpose:
+    their errors explain themselves."""
+    tool = agent.tools.get("browser_close") if hasattr(agent, "tools") else None
+    if tool is not None:
+        try:
+            tool.function()
+        except Exception as e:  # noqa: BLE001  (a browser that won't close must not end the turn)
+            ui.say(f"(could not reset the browser before retrying: {e})")
+
+
 def _run_agent_once(agent, client, messages: list) -> tuple[str, dict]:
     """One attempt: call the model, run the tools it asks for, repeat until it answers in text.
 
     Returns the answer and what happened: submitted (the user approved a final submit),
-    out_of_steps, empty, and tool_log (the full tool results, for reflection)."""
+    asked_user (the user was asked or confirmed something), out_of_steps, empty, and
+    tool_log (the tool results, shortened, for reflection)."""
     max_steps = agent.model.get("max_steps", 10)
     nudged = False
     sources = []  # full tool results of this turn (the history copies may get trimmed)
-    outcome = {"submitted": False, "out_of_steps": False, "empty": False, "tool_log": ""}
+    outcome = {"submitted": False, "asked_user": False, "out_of_steps": False, "empty": False, "tool_log": ""}
     tool_log = []
 
     for _ in range(max_steps):
@@ -223,6 +241,10 @@ def _run_agent_once(agent, client, messages: list) -> tuple[str, dict]:
             failed = result.startswith("error:")
             if call.function.name == "browser_click" and result.startswith(SUBMITTED_MARKER):
                 outcome["submitted"] = True
+            if call.function.name in USER_TOOLS or (
+                call.function.name == "browser_click" and result.startswith(USER_ANSWER_PREFIXES)
+            ):
+                outcome["asked_user"] = True
             tool_log.append(f"Tool: {call.function.name}, Args: {call.function.arguments}, Result: {result[:200]}")
 
             if agent.log_level == "debug":

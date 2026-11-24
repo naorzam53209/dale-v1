@@ -141,9 +141,9 @@ def test_submitted_booking_is_never_retried(isolated):
     assert agent.calls.count("browser_click") == 3  # one attempt only
 
 
-def test_booking_retries_when_out_of_steps(isolated):
+def test_booking_retries_when_out_of_steps_without_an_answer(isolated):
     client = FakeClient(
-        [_tool_call("web_search", {"query": "meatbar"})] * 2 + [_text("not sure")]  # attempt 1: out of steps
+        [_tool_call("web_search", {"query": "meatbar"})] * 2 + [_text("")]  # attempt 1: out of steps, no answer
         + [_text("Free at 15:00, book at https://ontopo.com/x")]  # attempt 2
     )
     agent = FakeAgent("booking", max_retries=3, max_steps=2)
@@ -151,14 +151,52 @@ def test_booking_retries_when_out_of_steps(isolated):
     assert answer.startswith("Free at 15:00")
 
 
+def test_out_of_steps_with_a_good_answer_is_kept(isolated):
+    # the out-of-steps nudge produced a sourced answer: no retry, no wasted rerun
+    client = FakeClient([_tool_call("web_search", {"query": "a"})] * 2 + [_text("EPS $1.98, source https://x")])
+    agent = FakeAgent("research", max_retries=2, max_steps=2)
+    answer = harness.run_agent(agent, client, _start(), "Apple EPS?")
+    assert answer.startswith("EPS $1.98")
+    assert len(client.agent_requests()) == 3  # 2 tool steps + the nudge, one attempt
+
+
+@pytest.mark.parametrize("tool, result", [
+    ("ask_user", "user answered: 20:00"),
+    ("request_payment", "card ready"),
+    ("browser_click", "the user declined this submission; ask them what to change, or stop"),
+    ("browser_click", 'the user accepted the terms; clicked [e3] "I agree".'),
+])
+def test_no_retry_after_the_user_was_asked(isolated, tool, result):
+    client = FakeClient([_tool_call(tool, {})] * 2 + [_text("")])  # out of steps, no answer: a failure
+    agent = FakeAgent("booking", max_retries=3, max_steps=2, tool_results={tool: result})
+    answer = harness.run_agent(agent, client, _start(), "book it")
+    assert answer.startswith("(stopped after")
+    assert len(client.agent_requests()) == 3  # one attempt only: the user is not asked again
+    assert client.reflection_count() == 1  # still reflected on for next time
+
+
+def test_retry_closes_the_browser_first(isolated):
+    closed = []
+    client = FakeClient([_tool_call("browser_open", {"url": "https://x"})] * 2 + [_text("")] + [_text("Free at 19:00")])
+    agent = FakeAgent("booking", max_retries=1, max_steps=2)
+    agent.tools = {"browser_close": SimpleNamespace(function=lambda: closed.append(True) or "closed")}
+    harness.run_agent(agent, client, _start(), "table?")
+    assert closed == [True]
+
+
 def test_attempt_failed_rules():
     booking, research = ReflectionEngine(agent_type="booking"), ReflectionEngine(agent_type="research")
     assert not booking.attempt_failed("Free at 19:00, link: https://x", {})
     assert booking.attempt_failed("(stopped after 40 steps without a final answer)", {})
-    assert not booking.attempt_failed("(stopped after 40 steps)", {"submitted": True})
-    assert booking.attempt_failed("anything", {"out_of_steps": True})
+    assert booking.attempt_failed("", {"empty": True})
+    assert not booking.attempt_failed("Free at 19:00, link: https://x", {"out_of_steps": True})
     assert research.attempt_failed("no", {})
-    assert not research.attempt_failed("Apple EPS $1.98, source: https://x", {})
+    assert not research.attempt_failed("Apple EPS $1.98, source: https://x", {"out_of_steps": True})
+    stopped = "(stopped after 40 steps)"
+    assert booking.should_retry(stopped, 3, 0, {})
+    assert not booking.should_retry(stopped, 3, 0, {"submitted": True})
+    assert not booking.should_retry(stopped, 3, 0, {"asked_user": True})
+    assert not booking.should_retry(stopped, 3, 3, {})
 
 
 # --- 3. a retry starts from a clean conversation ---------------------------------
@@ -210,3 +248,30 @@ def test_success_with_every_turn_writes_exactly_one(isolated):
     harness.run_agent(agent, client, _start(), "q")
     assert client.reflection_count() == 1
     assert len(_stored_reflections(isolated, "research")) == 1
+
+
+# --- an approved submit is always reported, even when the page can't be read ---------
+
+
+def test_submit_marker_survives_a_page_error(monkeypatch):
+    from agentic_harness_build import browser
+
+    info = {"text": "Book now", "label": "", "value": "", "name": "", "id": "", "tag": "button",
+            "type": "submit", "in_form": True}
+    monkeypatch.setattr(browser, "current_url", lambda: "https://venue.example/checkout")
+    monkeypatch.setattr(browser, "_element", lambda ref: (info, object()))
+    monkeypatch.setattr(browser, "_not_ready_to_submit", lambda final: None)
+    monkeypatch.setattr(browser.ui, "show", lambda *a, **k: None)
+    monkeypatch.setattr(browser.ui, "confirm", lambda *a, **k: True)
+    wiped = []
+    monkeypatch.setattr(browser.payment, "has_card", lambda: True)
+    monkeypatch.setattr(browser.payment, "wipe", lambda *a, **k: wiped.append(True))
+
+    def page_navigated(*args):
+        raise RuntimeError("Execution context was destroyed, most likely because of a navigation")
+
+    monkeypatch.setattr(browser, "_click_and_read", page_navigated)
+    result = browser.browser_click("e7")
+    assert result.startswith(SUBMITTED_MARKER)
+    assert "may have gone through" in result
+    assert wiped == [True]  # the card is still wiped after a failed read

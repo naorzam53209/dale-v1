@@ -399,11 +399,30 @@ def browser_click(ref: str) -> str:
         if not ui.confirm("Submit?", strict=True):
             return "the user declined this submission; ask them what to change, or stop"
 
+    accepted_terms = ""
     if TERMS.search(title):  # accepting terms is the user's legal consent, not the agent's
         ui.show(f"The site asks you to accept: \"{title}\" ({current_url()})")
         if not ui.confirm("Accept?"):
             return "the user did not accept the terms; stop and tell them the booking needs it"
+        accepted_terms = f"the user accepted the terms; clicked [{ref}] \"{title}\"."  # "the user ": the harness sees they were asked
 
+    if not is_submit:
+        return _click_and_read(ref, title, locator, accepted_terms)
+    # The user approved a final submit. From here on the result must start with SUBMITTED_MARKER,
+    # whatever happens: the harness reads it to never retry (and so never repeat) a submission.
+    # A click or a page read that fails after this point may still have sent the booking.
+    note = f"{SUBMITTED_MARKER} Clicked [{ref}] \"{title}\" after the user approved it."
+    try:
+        return _click_and_read(ref, title, locator, note)
+    except Exception as e:  # noqa: BLE001  (any failure here leaves the submission's outcome unknown)
+        return (f"{note} Reading the page afterwards failed ({str(e).splitlines()[0][:120]}); "
+                "the booking may have gone through. Call browser_view to check before doing anything else.")
+    finally:
+        if payment.has_card():
+            payment.wipe()  # card used once; a new payment needs a new request_payment
+
+
+def _click_and_read(ref: str, title: str, locator, note: str = "") -> str:
     old_url = current_url()
     locator.click()
     page = _session.page
@@ -412,13 +431,9 @@ def browser_click(ref: str) -> str:
         page.wait_for_load_state("networkidle", timeout=ACTION_TIMEOUT_MS)
     except PlaywrightError:
         pass  # pages that keep polling never go idle; the snapshot below is still useful
-    if is_submit and payment.has_card():
-        payment.wipe()  # card used once; a new payment needs a new request_payment
     if current_url() != old_url:
         _session.filled = {}
-    if is_submit:  # the harness reads this marker: a submitted booking must never be retried automatically
-        return _snapshot(f"{SUBMITTED_MARKER} Clicked [{ref}] \"{title}\" after the user approved it.")
-    return _snapshot(f"Clicked [{ref}] \"{title}\".")
+    return _snapshot(note or f"Clicked [{ref}] \"{title}\".")
 
 
 def browser_show() -> str:

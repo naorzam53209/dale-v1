@@ -13,6 +13,10 @@ from pathlib import Path
 
 # browser_click starts its result with this after the user approved a final submit (book, pay...)
 SUBMITTED_MARKER = "SUBMITTED:"
+# tools that always put a question to the user
+USER_TOOLS = frozenset({"ask_user", "request_payment"})
+# how browser_click results start when it asked the user (approved submit, declined submit or terms)
+USER_ANSWER_PREFIXES = (SUBMITTED_MARKER, "the user ")
 # answers the harness writes itself when an attempt produced nothing usable
 HARNESS_FAILURE_MARKERS = ("(the model gave an empty answer", "(stopped after")
 
@@ -281,16 +285,14 @@ Reflection:"""
     def attempt_failed(self, result: str, outcome: Optional[dict] = None) -> bool:
         """Did this attempt fail badly enough that running it again could help?
 
-        outcome comes from the harness: submitted (a final submit the user approved),
-        out_of_steps, empty. For booking, an answer without a confirmation phrase is
-        not a failure: availability checks, "book it here" links and questions back to
-        the user are all correct answers. Only clear failures count there."""
+        Judged on the answer, not on how long it took: running out of tool steps is not a
+        failure by itself, because the harness then asks for an answer from what was found,
+        and that answer can be complete. outcome comes from the harness (empty: the model
+        gave no answer at all). For booking, an answer without a confirmation phrase is not
+        a failure: availability checks, "book it here" links and questions back to the user
+        are all correct answers. Only clear failures count there."""
         outcome = outcome or {}
-        if outcome.get("submitted"):
-            return False  # never redo a submitted booking: it could book twice
-        if outcome.get("out_of_steps") or outcome.get("empty"):
-            return True
-        if result.strip().startswith(HARNESS_FAILURE_MARKERS):
+        if outcome.get("empty") or result.strip().startswith(HARNESS_FAILURE_MARKERS):
             return True
         if self.agent_type == "booking":
             return False
@@ -298,8 +300,13 @@ Reflection:"""
 
     def should_retry(self, result: str, max_retries: int = 3, current_attempt: int = 0,
                      outcome: Optional[dict] = None) -> bool:
-        """Retry while attempts are left and this attempt failed (see attempt_failed)."""
-        if current_attempt >= max_retries:
+        """Retry while attempts are left and this attempt failed (see attempt_failed).
+
+        Never retry an attempt that involved the user: a retry starts from the original
+        conversation, so it would ask them the same questions again, and after a submit
+        they approved it could book or pay twice."""
+        outcome = outcome or {}
+        if current_attempt >= max_retries or outcome.get("submitted") or outcome.get("asked_user"):
             return False
         return self.attempt_failed(result, outcome)
 
