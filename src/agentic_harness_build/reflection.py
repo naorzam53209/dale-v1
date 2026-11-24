@@ -11,6 +11,16 @@ from typing import List, Optional
 from pathlib import Path
 
 
+# browser_click starts its result with this after the user approved a final submit (book, pay...)
+SUBMITTED_MARKER = "SUBMITTED:"
+# tools that always put a question to the user
+USER_TOOLS = frozenset({"ask_user", "request_payment"})
+# how browser_click results start when it asked the user (approved submit, declined submit or terms)
+USER_ANSWER_PREFIXES = (SUBMITTED_MARKER, "the user ")
+# answers the harness writes itself when an attempt produced nothing usable
+HARNESS_FAILURE_MARKERS = ("(the model gave an empty answer", "(stopped after")
+
+
 class ReflexionStrategy(Enum):
     """Reflection strategies for verbal reinforcement learning."""
     NONE = 'none'
@@ -272,22 +282,33 @@ Reflection:"""
             self.storage.save_reflection(self.task_type, reflection, {"request": request})
             self.reflections_str += "\n" + self._format_reflections(header="")
 
-    def should_retry(self, result: str, max_retries: int = 3, current_attempt: int = 0) -> bool:
-        """Determine if we should retry based on success detection and retry count.
+    def attempt_failed(self, result: str, outcome: Optional[dict] = None) -> bool:
+        """Did this attempt fail badly enough that running it again could help?
 
-        Args:
-            result: The result/answer from the current attempt
-            max_retries: Maximum number of retries allowed
-            current_attempt: Current attempt number (0-indexed)
-
-        Returns:
-            True if we should retry, False otherwise
-        """
-        if current_attempt >= max_retries:
+        Judged on the answer, not on how long it took: running out of tool steps is not a
+        failure by itself, because the harness then asks for an answer from what was found,
+        and that answer can be complete. outcome comes from the harness (empty: the model
+        gave no answer at all). For booking, an answer without a confirmation phrase is not
+        a failure: availability checks, "book it here" links and questions back to the user
+        are all correct answers. Only clear failures count there."""
+        outcome = outcome or {}
+        if outcome.get("empty") or result.strip().startswith(HARNESS_FAILURE_MARKERS):
+            return True
+        if self.agent_type == "booking":
             return False
+        return not self.detect_success(result)
 
-        success = self.detect_success(result)
-        return not success
+    def should_retry(self, result: str, max_retries: int = 3, current_attempt: int = 0,
+                     outcome: Optional[dict] = None) -> bool:
+        """Retry while attempts are left and this attempt failed (see attempt_failed).
+
+        Never retry an attempt that involved the user: a retry starts from the original
+        conversation, so it would ask them the same questions again, and after a submit
+        they approved it could book or pay twice."""
+        outcome = outcome or {}
+        if current_attempt >= max_retries or outcome.get("submitted") or outcome.get("asked_user"):
+            return False
+        return self.attempt_failed(result, outcome)
 
     def get_reflection_for_retry(self, request: str, actions: str, result: str, client, model: dict) -> str:
         """Generate a reflection specifically for retry context.

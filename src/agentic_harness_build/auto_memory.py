@@ -44,6 +44,27 @@ def _get_memory_type_filename(memory_type: str) -> str:
     return type_files.get(memory_type, f"{memory_type}_notes.md")
 
 
+SAFE_FILENAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\.md")
+
+
+def _safe_filename(name) -> str | None:
+    """A plain file name inside the memory folder, or None.
+
+    The name comes from the model, whose input includes web page text, so it must not
+    be able to point anywhere else: no folders, no '..', no other extensions, and never
+    the index itself."""
+    if not isinstance(name, str):
+        return None
+    name = name.strip()
+    if not name.endswith(".md"):
+        name += ".md"
+    if not SAFE_FILENAME.fullmatch(name) or name.upper() == "MEMORY.MD":
+        return None
+    if (MEMORY_DIR / name).resolve().parent != MEMORY_DIR.resolve():
+        return None
+    return name
+
+
 def _update_memory_index(new_file: str, description: str):
     """Update MEMORY.md index with new memory file."""
     index_file = MEMORY_DIR / "MEMORY.md"
@@ -140,13 +161,12 @@ def save_learnings(learnings: list[dict], max_per_turn: int = 3):
     learnings = learnings[:max_per_turn]
 
     for learning in learnings:
-        memory_type = learning.get("type", "project")
-        filename = learning.get("file") or _get_memory_type_filename(memory_type)
-        file_path = MEMORY_DIR / filename
-
-        # Ensure filename is safe
-        if not filename.endswith(".md"):
-            filename += ".md"
+        if not isinstance(learning, dict):
+            continue
+        memory_type = str(learning.get("type", "project"))
+        filename = _safe_filename(learning.get("file")) or _safe_filename(_get_memory_type_filename(memory_type))
+        if not filename:
+            continue
         file_path = MEMORY_DIR / filename
 
         # Append learning to file

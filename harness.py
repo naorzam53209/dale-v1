@@ -10,7 +10,9 @@ from openai import APIError, OpenAI
 
 from agentic_harness_build import ui
 from agentic_harness_build.manifest import ManifestError, load_assistant
-from agentic_harness_build.reflection import ReflectionEngine, ReflexionStrategy
+from agentic_harness_build.reflection import (
+    SUBMITTED_MARKER, USER_ANSWER_PREFIXES, USER_TOOLS, ReflectionEngine, ReflexionStrategy,
+)
 from agentic_harness_build.memory import load_memory_index, ensure_memory_dir
 from agentic_harness_build.auto_memory import extract_learnings, save_learnings
 
@@ -139,80 +141,84 @@ def _shorten(agent, client, messages: list, answer: str) -> str:
     return _plain(answer)
 
 
+def _reflection_engine(agent):
+    """The agent's ReflectionEngine with its stored reflections loaded, or None when reflection is off."""
+    if not agent.reflection.get("enabled", False):
+        return None
+    task_type = agent.reflection.get("task_type", "default")
+    engine = ReflectionEngine(
+        strategy=ReflexionStrategy(agent.reflection.get("strategy", "reflexion")),
+        task_type=task_type,
+        agent_type=task_type,  # task_type doubles as the agent type (booking, research...) for its prompts
+    )
+    engine.load_stored_reflections(limit=agent.reflection.get("max_reflections", 5))
+    return engine
+
+
+def _with_reflections(base: list, engine) -> list:
+    """A fresh copy of the turn's starting messages, with the current reflections added to the system prompt."""
+    attempt = [dict(m) for m in base]
+    context = engine.get_reflections_context() if engine else ""
+    if context and attempt and attempt[0].get("role") == "system":
+        attempt[0]["content"] += "\n\n" + context
+    return attempt
+
+
 def run_agent(agent, client, messages: list, user_input: str = "") -> str:
-    """Call the model, run any tool calls it asks for, repeat until it answers in text.
+    """Answer one user message, retrying with a self-reflection when an attempt fails (Reflexion).
 
-    Implements true Reflexion: retry loop with reflection on failure.
+    Every attempt starts from the same messages the turn started with, plus the reflections so far:
+    a retry never sees the failed attempt's tool calls or answer, only the lesson drawn from it.
+    Each attempt is reflected on at most once. On return, `messages` holds the attempt that was kept.
     """
-    max_steps = agent.model.get("max_steps", 10)
-    max_retries = agent.reflection.get("max_retries", 3) if agent.reflection.get("enabled", False) else 0
+    engine = _reflection_engine(agent)
+    max_retries = agent.reflection.get("max_retries", 0) if engine else 0
+    base = [dict(m) for m in messages]
 
-    # Initialize reflection engine if enabled
-    reflection_engine = None
-    if agent.reflection.get("enabled", False):
-        strategy_str = agent.reflection.get("strategy", "reflexion")
-        strategy = ReflexionStrategy(strategy_str)
-        task_type = agent.reflection.get("task_type", "default")
-        agent_type = task_type  # Use task_type as agent_type (booking, research, etc.)
-        reflection_engine = ReflectionEngine(strategy=strategy, task_type=task_type, agent_type=agent_type)
-        reflection_engine.load_stored_reflections(limit=agent.reflection.get("max_reflections", 5))
-
-        # Inject stored reflections into the system message
-        reflections_context = reflection_engine.get_reflections_context()
-        if reflections_context:
-            for i, msg in enumerate(messages):
-                if msg.get("role") == "system":
-                    messages[i] = {"role": "system", "content": msg["content"] + "\n\n" + reflections_context}
-                    break
-
-    # Reflexion retry loop
     for attempt in range(max_retries + 1):
         if attempt > 0:
             ui.say(f"[reflexion] Retry attempt {attempt}/{max_retries}")
-
-        answer = _run_agent_once(agent, client, messages, user_input, reflection_engine)
-
-        # Check if we should retry
-        if reflection_engine and attempt < max_retries:
-            if reflection_engine.should_retry(answer, max_retries, attempt):
-                # Generate reflection for this failed attempt
-                actions_str = "\n".join([m.get("content", "")[:200] for m in messages if m.get("role") == "tool"])
-                reflection = reflection_engine.get_reflection_for_retry(
-                    user_input, actions_str, answer, client, agent.model
-                )
-
-                # Store the reflection
-                reflection_engine.reflections.append(reflection)
-                reflection_engine.storage.save_reflection(
-                    reflection_engine.task_type, reflection, {"request": user_input, "attempt": attempt}
-                )
-                reflection_engine.reflections_str = reflection_engine._format_reflections()
-
-                # Inject the new reflection into the system message for retry
-                for i, msg in enumerate(messages):
-                    if msg.get("role") == "system":
-                        # Remove old reflections and add new one
-                        base_content = msg["content"].split("\n\nYou have attempted")[0]
-                        messages[i] = {"role": "system", "content": base_content + "\n\n" + reflection_engine.reflections_str}
-                        break
-
-                continue  # Retry
-            else:
-                # Success or max retries reached
-                break
-        else:
-            # No reflection or no retries left
+        attempt_messages = _with_reflections(base, engine)
+        answer, outcome = _run_agent_once(agent, client, attempt_messages)
+        failed = engine.attempt_failed(answer, outcome) if engine else False
+        if not (engine and failed and engine.should_retry(answer, max_retries, attempt, outcome)):
             break
+        # reflect on the failed attempt (once), then run the turn again from the start
+        engine.update_reflections(user_input, outcome["tool_log"], answer, client, agent.model, reflect_after="every_turn")
+        _reset_tool_state(agent)
 
+    messages[:] = attempt_messages
+    # the kept attempt has not been reflected on yet: do it now if the manifest asks for it
+    if engine and (agent.reflection.get("reflect_after", "every_turn") == "every_turn" or failed):
+        engine.update_reflections(user_input, outcome["tool_log"], answer, client, agent.model, reflect_after="every_turn")
     return answer
 
 
-def _run_agent_once(agent, client, messages: list, user_input: str, reflection_engine=None) -> str:
-    """Single attempt at running the agent (one turn through the tool loop)."""
+def _reset_tool_state(agent):
+    """Undo what a failed attempt left behind that the retry cannot see in its fresh conversation.
+
+    The browser would still show the old page with stale refs and keep an approved card usable,
+    so close it (which also wipes the card). Lists like the failed-URL cache are kept on purpose:
+    their errors explain themselves."""
+    tool = agent.tools.get("browser_close") if hasattr(agent, "tools") else None
+    if tool is not None:
+        try:
+            tool.function()
+        except Exception as e:  # noqa: BLE001  (a browser that won't close must not end the turn)
+            ui.say(f"(could not reset the browser before retrying: {e})")
+
+
+def _run_agent_once(agent, client, messages: list) -> tuple[str, dict]:
+    """One attempt: call the model, run the tools it asks for, repeat until it answers in text.
+
+    Returns the answer and what happened: submitted (the user approved a final submit),
+    asked_user (the user was asked or confirmed something), out_of_steps, empty, and
+    tool_log (the tool results, shortened, for reflection)."""
     max_steps = agent.model.get("max_steps", 10)
     nudged = False
     sources = []  # full tool results of this turn (the history copies may get trimmed)
-    full_tool_results = []  # Store full results for reflection context
+    outcome = {"submitted": False, "asked_user": False, "out_of_steps": False, "empty": False, "tool_log": ""}
+    tool_log = []
 
     for _ in range(max_steps):
         message = _ask(agent, client, messages, tools=agent.openai_tools())
@@ -220,17 +226,11 @@ def _run_agent_once(agent, client, messages: list, user_input: str, reflection_e
         if not message.tool_calls:
             if (message.content or "").strip():
                 messages.append(_assistant_entry(message))
-                answer = _finish(agent, client, messages, message.content, sources)
-
-                # Store reflection for cross-turn learning (not retry)
-                if reflection_engine:
-                    reflect_after = agent.reflection.get("reflect_after", "every_turn")
-                    actions_str = "\n".join(full_tool_results)
-                    reflection_engine.update_reflections(user_input, actions_str, answer, client, agent.model, reflect_after)
-
-                return answer
+                outcome["tool_log"] = "\n".join(tool_log)
+                return _finish(agent, client, messages, message.content, sources), outcome
             if nudged:
-                return "(the model gave an empty answer twice; try rephrasing the question)"
+                outcome.update(empty=True, tool_log="\n".join(tool_log))
+                return "(the model gave an empty answer twice; try rephrasing the question)", outcome
             messages.append({"role": "user", "content": EMPTY_ANSWER_NUDGE})
             nudged = True
             continue
@@ -239,7 +239,13 @@ def _run_agent_once(agent, client, messages: list, user_input: str, reflection_e
         for call in message.tool_calls:
             result = agent.call_tool(call.function.name, call.function.arguments)
             failed = result.startswith("error:")
-            full_tool_results.append(f"Tool: {call.function.name}, Args: {call.function.arguments}, Result: {result}")
+            if call.function.name == "browser_click" and result.startswith(SUBMITTED_MARKER):
+                outcome["submitted"] = True
+            if call.function.name in USER_TOOLS or (
+                call.function.name == "browser_click" and result.startswith(USER_ANSWER_PREFIXES)
+            ):
+                outcome["asked_user"] = True
+            tool_log.append(f"Tool: {call.function.name}, Args: {call.function.arguments}, Result: {result[:200]}")
 
             if agent.log_level == "debug":
                 ui.end_status()
@@ -251,21 +257,13 @@ def _run_agent_once(agent, client, messages: list, user_input: str, reflection_e
             sources.append(result)
 
     # out of steps: make it answer with what it has
+    outcome.update(out_of_steps=True, tool_log="\n".join(tool_log))
     messages.append({"role": "user", "content": OUT_OF_STEPS_NUDGE})
     message = _ask(agent, client, messages)
     messages.append(_assistant_entry(message))
     if not message.content:
-        answer = f"(stopped after {max_steps} steps without a final answer)"
-    else:
-        answer = _finish(agent, client, messages, message.content, sources)
-
-    # Store reflection for cross-turn learning
-    if reflection_engine:
-        reflect_after = agent.reflection.get("reflect_after", "every_turn")
-        actions_str = "\n".join(full_tool_results)
-        reflection_engine.update_reflections(user_input, actions_str, answer, client, agent.model, reflect_after)
-
-    return answer
+        return f"(stopped after {max_steps} steps without a final answer)", outcome
+    return _finish(agent, client, messages, message.content, sources), outcome
 
 
 def _client(model: dict) -> OpenAI:
