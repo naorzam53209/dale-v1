@@ -15,6 +15,7 @@ from playwright.sync_api import sync_playwright
 
 from . import payment, ui
 from .profile import REQUIRED_FOR_BOOKING, confirmed_details, missing_for_booking
+from .reflection import SUBMITTED_MARKER  # starts the result of a final click the user approved
 
 BROWSER_DATA = Path(__file__).resolve().parents[2] / "data" / "browser"  # cookies/logins persist here
 HEADLESS = os.getenv("BROWSER_HEADLESS", "1") != "0"  # hidden unless BROWSER_HEADLESS=0
@@ -415,6 +416,8 @@ def browser_click(ref: str) -> str:
         payment.wipe()  # card used once; a new payment needs a new request_payment
     if current_url() != old_url:
         _session.filled = {}
+    if is_submit:  # the harness reads this marker: a submitted booking must never be retried automatically
+        return _snapshot(f"{SUBMITTED_MARKER} Clicked [{ref}] \"{title}\" after the user approved it.")
     return _snapshot(f"Clicked [{ref}] \"{title}\".")
 
 
